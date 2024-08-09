@@ -1,11 +1,16 @@
 use std::collections::HashSet;
 
 use indoc::formatdoc;
-use srdf::{QuerySRDF, RDFNode, SRDFBasic, SRDF};
+use shacl_ast::Schema;
+use srdf::RDF_TYPE;
+use srdf::{QuerySRDF, RDFNode, SRDFBasic, RDFS_SUBCLASS_OF, SRDF};
 
 use crate::constraints::constraint_error::ConstraintError;
 use crate::constraints::DefaultConstraintComponent;
 use crate::constraints::SparqlConstraintComponent;
+use crate::helper::srdf::get_objects_for;
+use crate::runner::sparql_runner::SparqlValidatorRunner;
+use crate::runner::srdf_runner::DefaultValidatorRunner;
 use crate::validation_report::report::ValidationReport;
 
 /// The condition specified by sh:class is that each value node is a SHACL
@@ -13,54 +18,72 @@ use crate::validation_report::report::ValidationReport;
 ///
 /// https://www.w3.org/TR/shacl/#ClassConstraintComponent
 pub(crate) struct Class<S: SRDFBasic> {
-    class_rule: Option<S::IRI>,
+    class_rule: S::Term,
 }
 
 impl<S: SRDFBasic> Class<S> {
     pub fn new(class_rule: RDFNode) -> Self {
         Class {
-            class_rule: S::term_as_iri(&S::object_as_term(&class_rule)),
+            class_rule: S::object_as_term(&class_rule),
         }
     }
 }
 
-impl<S: SRDF> DefaultConstraintComponent<S> for Class<S> {
+impl<S: SRDF + 'static> DefaultConstraintComponent<S> for Class<S> {
     fn evaluate_default(
         &self,
-        _: &S,
-        _value_nodes: HashSet<S::Term>,
-        _report: &mut ValidationReport<S>,
-    ) -> Result<(), ConstraintError> {
-        Err(ConstraintError::NotImplemented)
+        store: &S,
+        _: &Schema,
+        _: &DefaultValidatorRunner,
+        value_nodes: &HashSet<S::Term>,
+        report: &mut ValidationReport<S>,
+    ) -> Result<bool, ConstraintError> {
+        let mut ans = true;
+        for node in value_nodes {
+            let is_class_valid = get_objects_for(store, node, &S::iri_s2iri(&RDF_TYPE))?
+                .iter()
+                .any(|ctype| {
+                    ctype == &self.class_rule
+                        || get_objects_for(store, ctype, &S::iri_s2iri(&RDFS_SUBCLASS_OF))
+                            .unwrap_or_default()
+                            .contains(&self.class_rule)
+                });
+            if !is_class_valid {
+                report.make_validation_result(Some(node));
+                ans = false;
+            }
+        }
+        Ok(ans)
     }
 }
 
-impl<S: QuerySRDF> SparqlConstraintComponent<S> for Class<S> {
+impl<S: QuerySRDF + 'static> SparqlConstraintComponent<S> for Class<S> {
     fn evaluate_sparql(
         &self,
         store: &S,
-        value_nodes: HashSet<S::Term>,
+        _: &Schema,
+        _: &SparqlValidatorRunner,
+        value_nodes: &HashSet<S::Term>,
         report: &mut ValidationReport<S>,
-    ) -> Result<(), ConstraintError> {
-        for node in &value_nodes {
-            if let Some(class_rule) = &self.class_rule {
-                let query = formatdoc! {"
+    ) -> Result<bool, ConstraintError> {
+        let mut ans = true;
+        for node in value_nodes {
+            let query = formatdoc! {"
                     PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
                     PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
                     ASK {{ {} rdf:type/rdfs:subClassOf* {} }}
-                ", node, class_rule,
-                };
-                let ans = match store.query_ask(&query) {
-                    Ok(ans) => ans,
-                    Err(_) => return Err(ConstraintError::Query),
-                };
-                if !ans {
-                    report.make_validation_result(Some(node));
-                }
-            } else {
-                report.make_validation_result(Some(node))
+                ", node, self.class_rule,
+            };
+            let ask = match store.query_ask(&query) {
+                Ok(ask) => ask,
+                Err(_) => return Err(ConstraintError::Query),
+            };
+            if !ask {
+                ans = false;
+                report.make_validation_result(Some(node));
             }
         }
-        Ok(())
+
+        Ok(ans)
     }
 }
